@@ -1,0 +1,725 @@
+From 2cc524244e142c455613931d30afb62bd056f7c8 Mon Sep 17 00:00:00 2001
+From: jamesc <jamesc@node0.agamotto.ntucsie-pg0.utah.cloudlab.us>
+Date: Mon, 19 Dec 2022 00:51:32 -0700
+Subject: [PATCH 2/2] Profilin
+
+---
+ migration/periscope-delta-snap-hash.c |  41 +++++
+ migration/periscope-syzkaller.c       |   4 +-
+ migration/periscope.c                 | 236 ++++++++++++++++++++++----
+ migration/periscope.h                 |   7 +-
+ 4 files changed, 248 insertions(+), 40 deletions(-)
+
+diff --git a/migration/periscope-delta-snap-hash.c b/migration/periscope-delta-snap-hash.c
+index 38592b25b9..31a9d08c7c 100644
+--- a/migration/periscope-delta-snap-hash.c
++++ b/migration/periscope-delta-snap-hash.c
+@@ -7,6 +7,8 @@
+ #include "migration/ram.h"
+ #include "exec/ram_addr.h"
+ 
++#include <sys/time.h>
++#include <time.h>
+ #ifdef PERI_DEDUP
+ #include <sys/types.h>
+ #include <sys/stat.h>
+@@ -637,11 +639,14 @@ periscope_ramblock *get_ramblock(periscope_ramblock *prbs, unsigned int nprb, co
+ 
+ #ifdef PERI_DEDUP_NOHASH
+ static void delete_stored_pages(periscope_ramblock *prb, periscope_ramblock *prb_parent) {
++   write_log("PERI_DEDUP_NOHASH");
+    return;
+ }
+ #else
+ static void delete_stored_pages(periscope_ramblock *prb, periscope_ramblock *prb_parent) {
++   write_log("! PERI_DEDUP_NOHASH");
+ #ifdef FINE_CHUNKS
++   write_log("FINE_CHUNKS");
+    ram_cache_meta *rcm = get_cache_meta(prb->idstr);
+ #endif
+ 
+@@ -709,52 +714,88 @@ static void delete_ramblock(periscope_ramblock *prb, periscope_ramblock *prb_par
+ #ifdef TRACE_DEBUG
+    printf("Delete rb %s\n", prb->idstr);
+ #endif
++   struct timeval t1, t2;
++   double elapsed;
++   char buf[256] = "";
+    if(prb->empty) return;
+    delete_stored_pages(prb, prb_parent);
+    if(prb->dirty) {
++      gettimeofday(&t1, NULL);
+       g_free(prb->dirty);
+       prb->dirty = NULL;
++      gettimeofday(&t2, NULL);
++      elapsed = get_elapsed_ms(t1, t2);
++      sprintf(buf, "Elapsed time for prb->dirty: %fms", elapsed);
++      write_log(buf);
+    }
+ #ifdef FINE_CHUNKS
+    if(prb->dirty_fine) {
+       g_free(prb->dirty_fine);
++      write_log("prb->dirty_fine");
+       prb->dirty_fine = NULL;
+    }
+ #endif
+ #ifdef DBG_RAM_STORED
+    if(prb->rambkp) {
+       g_free(prb->rambkp);
++      write_log("prb->rambkp");
+       prb->rambkp = NULL;
+    }
+    prb->rambkp_size = 0;
+ #endif
+    prb->npages_stored = 0;
+    if(prb->offsets){
++      gettimeofday(&t1, NULL);
+       g_free(prb->offsets);
++      write_log("prb->offsets");
+       prb->offsets = NULL;
++      gettimeofday(&t2, NULL);
++      elapsed = get_elapsed_ms(t1, t2);
++      sprintf(buf, "Elapsed time for prb->offsets: %fms", elapsed);
++      write_log(buf);
+    }
+ #ifdef PERI_DEDUP_NOHASH
+    if(prb->ram) {
++      gettimeofday(&t1, NULL);
+       g_free(prb->ram);
++      write_log("prb->ram");
+       prb->ram = NULL;
++      gettimeofday(&t2, NULL);
++      elapsed = get_elapsed_ms(t1, t2);
++      sprintf(buf, "Elapsed time for prb->ram: %fms", elapsed);
++      write_log(buf);
+    }
+ #else
+    if(prb->ram_idx) {
+       g_free(prb->ram_idx);
++      write_log("prb->ram_idx");
+       prb->ram_idx = NULL;
+    }
+ #endif
+    if(prb->zero_pages){
++      gettimeofday(&t1, NULL);
+       g_free(prb->zero_pages);
+       prb->zero_pages = NULL;
++      gettimeofday(&t2, NULL);
++      elapsed = get_elapsed_ms(t1, t2);
++      sprintf(buf, "Elapsed time for prb->zero_pages: %fms", elapsed);
++      write_log(buf);
+    }
+ }
+ 
+ void delete_peri_rbs(periscope_ramblock *prbs, unsigned int nprb,
+       periscope_ramblock *prbs_parent) {
+    if(prbs == NULL) return;
++   struct timeval t1, t2;
++   double elapsed;
++   char buf[256];
+    for(unsigned int i=0; i<nprb; ++i) {
++      gettimeofday(&t1, NULL);
+       delete_ramblock(&prbs[i], &prbs_parent[i]);
++      gettimeofday(&t2, NULL);
++      elapsed = get_elapsed_ms(t1, t2);
++      sprintf(buf, "Elapsed time for deleting rb %u: %fms", i, elapsed);
++      write_log(buf);
+    }
+    //g_free(prb);
+ }
+diff --git a/migration/periscope-syzkaller.c b/migration/periscope-syzkaller.c
+index bc889116cc..2b73ed1edb 100644
+--- a/migration/periscope-syzkaller.c
++++ b/migration/periscope-syzkaller.c
+@@ -27,6 +27,7 @@ static uint8_t
+     last_execute_req_input[sizeof(struct syzkaller_execute_req) + kMaxInput];
+ 
+ static uint64_t call_to_input_pos[30 * 10];
++uint64_t execution_num = 0;
+ 
+ // TODO(dokyungs): later this can be merged into periscope.c, which other
+ // fuzzer backends can also benefit from.
+@@ -654,9 +655,10 @@ static void restored(void)
+ static char *fetch_next(uint32_t *len)
+ {
+     // printf("periscope: syz fetch next\n");
+-
+     uint64 buf_len = 0;
+     uint32_t num_calls = 0;
++    
++    execution_num++;
+     read_execute_req(last_execute_req_input, &buf_len, &num_calls);
+ 
+     if (restore_policy == PERISCOPE_RESTORE_ROOT) {
+diff --git a/migration/periscope.c b/migration/periscope.c
+index 91cb4bde0e..f5149617cb 100644
+--- a/migration/periscope.c
++++ b/migration/periscope.c
+@@ -4,6 +4,9 @@
+ #include "qemu/cutils.h"
+ #include "qapi/error.h"
+ 
++#include <sys/time.h>
++#include <time.h>
++#include <stdio.h>
+ #include <stdlib.h>
+ #include <unistd.h>
+ #include <stdbool.h>
+@@ -82,6 +85,9 @@ static qemu_timeval total_restore_time = {0, 0};
+ static qemu_timeval total_chkpt_time = {0, 0};
+ static qemu_timeval total_chkpt_saving_time = {0, 0};
+ 
++static FILE *log_fp = NULL;
++extern uint64_t execution_num;
++
+ static void print_time_consumption_statistics(void) {
+     uint64_t exec_ms = total_exec_time.tv_sec * 1000L + total_exec_time.tv_usec / 1000L;
+     uint64_t restore_ms = total_restore_time.tv_sec * 1000L + total_restore_time.tv_usec / 1000L;
+@@ -221,8 +227,20 @@ static periscope_cp_desc *get_longest_match(char *ref, uint32_t reflen,
+ //#define FULL_DELTA_RESTORE
+ //#define FULL_SNAPSHOT_RESTORE
+ 
++static int get_total_children(periscope_cp_desc *cp)
++{
++    int total = 0;
++    periscope_cp_desc *cur = cp;
++    while (cur != NULL) {
++        total += cur->n_children;
++        cur = cur->parent;
++    }
++    return total;
++}
++
+ static periscope_cp_desc *periscope_find_closest_snapshot(
+     char *next, uint32_t next_len, periscope_input_desc *cur, uint32_t *matched_len) {
++    
+ 
+     assert(next != NULL);
+     assert(cur != NULL);
+@@ -230,7 +248,12 @@ static periscope_cp_desc *periscope_find_closest_snapshot(
+     FuzzerState *s = fuzzer_get_current();
+     assert(s != NULL);
+     assert(s->root != NULL);
++    struct timeval t1, t2;
++    double elapsed;
++    char log_buf[1024] = "";
++    int total_children;
+ 
++    gettimeofday(&t1, NULL);
+     periscope_cp_desc* max_cp = get_longest_match(next, next_len, matched_len, &cp_root);
+ 
+ #define TRACE_SNAPSHOT_SEARCH
+@@ -249,6 +272,11 @@ static periscope_cp_desc *periscope_find_closest_snapshot(
+         qemu_gettimeofday(&cp->last_restored);
+         cp = cp->parent;
+     }
++    gettimeofday(&t2, NULL);
++    elapsed = get_elapsed_ms(t1, t2);
++    total_children = get_total_children(max_cp);
++    sprintf(log_buf, "Elapsed time of finding closest snapshot: %fms, total children on the path: %d", elapsed, total_children);
++    write_log(log_buf);
+ 
+ #ifdef FULL_SNAPSHOT_RESTORE
+     return &cp_root;
+@@ -433,6 +461,9 @@ static bool compare_ram_pages(void* ram0, void *ram1,
+ int periscope_checkpoint(uint64_t id) {
+     Error *err = NULL;
+     int ret;
++    struct timeval t1, t2, all_start, all_end;
++    double elapsed;
++    char log_buf[1024];
+ 
+     char pt_mark_buf[256];
+     snprintf(pt_mark_buf, 256, "## %s\n", __FUNCTION__);
+@@ -443,9 +474,11 @@ int periscope_checkpoint(uint64_t id) {
+         return -1;
+     }
+ 
++    gettimeofday(&all_start, NULL);
+     FuzzerState *s = fuzzer_get_current();
+     assert(s != NULL);
+ 
++/*
+ #ifdef DBG_RAM_STORED // set in periscope.h
+     if(s->cur_cp->parent) {
+        unsigned long *dirtytmp;
+@@ -460,6 +493,7 @@ int periscope_checkpoint(uint64_t id) {
+        g_free(dirtytmp);
+     }
+ #endif
++*/
+ 
+     char name[50];
+     char qname[50];
+@@ -518,19 +552,19 @@ int periscope_checkpoint(uint64_t id) {
+             // tv2.tv_usec -= tv1.tv_usec;
+         //}
+ 
+-#ifdef ENABLE_LW_CHKPT
+-#ifndef PERI_DEDUP
+-        MachineState *machine = MACHINE(qdev_get_machine());
+-        assert(machine != NULL);
+-        npages = machine->ram_size / TARGET_PAGE_SIZE;
+-        dirty = bitmap_new(npages);
+-        bitmap_fill(dirty, npages); // root snapshot has to be reset completely
+-        update_and_clear_delta_snap_bm(NULL);
+-    } else {
+-        //npages = get_current_delta_bm(&dirty);
+-        npages = update_and_clear_delta_snap_bm(&dirty);
+-#endif /* PERI_DEDUP */
+-#endif /* ENABLE_LW_CHKPT */
++// #ifdef ENABLE_LW_CHKPT
++// #ifndef PERI_DEDUP
++//         MachineState *machine = MACHINE(qdev_get_machine());
++//         assert(machine != NULL);
++//         npages = machine->ram_size / TARGET_PAGE_SIZE;
++//         dirty = bitmap_new(npages);
++//         bitmap_fill(dirty, npages); // root snapshot has to be reset completely
++//         update_and_clear_delta_snap_bm(NULL);
++//     } else {
++//         //npages = get_current_delta_bm(&dirty);
++//         npages = update_and_clear_delta_snap_bm(&dirty);
++// #endif /* PERI_DEDUP */
++// #endif /* ENABLE_LW_CHKPT */
+     }
+ 
+ #define FULL_CHKPT
+@@ -542,6 +576,7 @@ int periscope_checkpoint(uint64_t id) {
+     bitmap_fill(dirty, npages);
+ #endif
+ 
++/*
+ #ifndef ENABLE_LW_CHKPT
+     int memfd = memfd_create(name, 0);
+     int dupfd = dup(memfd);
+@@ -556,7 +591,7 @@ int periscope_checkpoint(uint64_t id) {
+     QEMUFile *file = qemu_fopen_channel_output(QIO_CHANNEL(iochannel));
+     object_unref(OBJECT(iochannel));
+ #endif
+-
++*/
+ #ifndef ENABLE_LW_CHKPT
+     peri_timer *pt = NULL;
+     pt = start_interval("periscope_checkpoint.timer");
+@@ -571,15 +606,18 @@ int periscope_checkpoint(uint64_t id) {
+ #ifdef PERI_DEDUP
+     int memfd_ram = -1;
+     int memfd_quick = -1;
++    int in_loop = 0;
+     unsigned long num_dirty_pages = 0;
+     size_t dev_sz = 0;
+     //s->cur_cp->snapshot.peri_rb = NULL;
+     //s->cur_cp->snapshot.n_peri_rb = 0;
++    gettimeofday(&t1, NULL);
+     if (id != SNAPSHOT_ROOT_ID) {
+        assert(s->cur_cp->snapshot.peri_rb == NULL);
+        assert(s->cur_cp->snapshot.n_peri_rb == 0);
+        int n_peri_rb = create_prb_and_clear_delta_bm(&s->cur_cp->snapshot.peri_rb, &num_dirty_pages, id);
+        while(n_peri_rb < 0) {
++          in_loop = 1;
+           printf("create_prb_and_clear_delta_bm failed, purging an retrying\n");
+           int ret = __periscope_purge_and_checkpoint_request(false);
+           assert(ret == 0);
+@@ -589,6 +627,15 @@ int periscope_checkpoint(uint64_t id) {
+     } else {
+        s->cur_cp->snapshot.n_peri_rb = create_prb_and_fill(&s->cur_cp->snapshot.peri_rb, &num_dirty_pages, id, true);
+     }
++    gettimeofday(&t2, NULL);
++    elapsed = get_elapsed_ms(t1, t2);
++    if (in_loop) {
++        sprintf(log_buf, "Elapsed time of creating prb (purge occurs): %fms, n_peri_rb: %u", elapsed, s->cur_cp->snapshot.n_peri_rb);
++    } else {
++        sprintf(log_buf, "Elapsed time of creating prb: %fms, n_peri_rb: %u", elapsed, s->cur_cp->snapshot.n_peri_rb);
++    }
++    write_log(log_buf);
++
+     uint8_t *buf_dev = periscope_quick_checkpoint(qname, &dev_sz);
+     assert(buf_dev);
+     assert(dev_sz > 0);
+@@ -682,6 +729,7 @@ int periscope_checkpoint(uint64_t id) {
+         return -1;
+     }
+ 
++/*
+ #ifndef PERI_DEDUP
+     s->cur_cp->snapshot.ram_sz = file_ram_sz;
+     s->cur_cp->snapshot.quick_sz = file_quick_sz;
+@@ -706,7 +754,8 @@ int periscope_checkpoint(uint64_t id) {
+     if (dirty)
+         g_free(dirty);
+ #endif
+-#endif /* !PERI_DEDUP */
++*/
++// #endif /* !PERI_DEDUP */
+ 
+     // update checkpoint memory usage
+     chkpt_memory_used += compute_memory_cost(s->cur_cp);
+@@ -728,6 +777,7 @@ int periscope_checkpoint(uint64_t id) {
+ #endif
+ 
+     // logging
++    /*
+     printf("periscope: checkpoint created (%lu ms): ",
+            chkpt_time.tv_sec * 1000L + chkpt_time.tv_usec / 1000L);
+ 
+@@ -744,7 +794,9 @@ int periscope_checkpoint(uint64_t id) {
+     printf("\n");
+ 
+     print_time_consumption_statistics();
++    */
+ 
++/*
+ #if 0 // savevm sometimes changes pc.ram
+ #ifdef DBG_RAM_STORED // set in periscope.h
+     printf("---------- comparing new chktp %d to pc.ram\n", s->cur_cp->snapshot.id);
+@@ -763,10 +815,13 @@ int periscope_checkpoint(uint64_t id) {
+        g_free(inv_dirty);
+     }
+ #endif
+-
++*/
+     s->cur_input->base_cp = s->cur_cp;
+     s->cur_cp = create_cp_desc(s->cur_cp);
+-
++    gettimeofday(&all_end, NULL);
++    elapsed = get_elapsed_ms(all_start, all_end);
++    sprintf(log_buf, "Elapsed time of single checkpointing: %fms", elapsed);
++    write_log(log_buf);
+     if (!periscope_restore_requested())
+         vm_start();
+ 
+@@ -1172,9 +1227,48 @@ static void collect_all_leaf_cps(periscope_cp_desc *cpd,
+     }
+ }
+ 
++void write_log(const char *string)
++{   
++    if (log_fp == NULL) {
++        log_fp = fopen("/storage/go/src/github.com/google/syzkaller/logs/fuzz.log", "w");
++    }
++    time_t t = time(NULL);
++    struct tm tm = *localtime(&t);
++    char time_str[128] = "";
++    sprintf(time_str, "%d-%02d-%02d %02d:%02d:%02d", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
++    fprintf(log_fp, "%s %s\n", time_str, string);
++    fflush(log_fp);
++    return;
++}
++
++static void get_path_to_root(periscope_cp_desc *cp, char *ret)
++{   
++    char tmp[16] = "";
++    int i = 0;
++    periscope_cp_desc *cur = cp;
++    while (cur != NULL) {
++        sprintf(tmp, "%d", cur->snapshot.id);
++        if (i == 0) {
++            sprintf(ret, "%s", tmp);
++            i = 1;
++        } else {
++            sprintf(ret, "%s -> %s", ret, tmp);
++        }
++        cur = cur->parent;
++    }
++    return;
++}
++
++double get_elapsed_ms(struct timeval before, struct timeval after)
++{
++    double t = (double)(after.tv_usec - before.tv_usec) / 1000 + (double)(after.tv_sec - before.tv_sec) * 1000;
++    return t;
++}
++
+ static int periscope_maybe_purge_checkpoints(periscope_cp_desc *cp_to_store,
+                                              uint64_t cost)
+ {
++    char log_buf[1024] = "";
+     FuzzerState *fs = fuzzer_get_current();
+     assert(fs);
+ 
+@@ -1188,29 +1282,43 @@ static int periscope_maybe_purge_checkpoints(periscope_cp_desc *cp_to_store,
+     printf("periscope: # of (initial) candidates = %d\n", candidates.num_cps);
+ 
+     int i = 0;
++    double elapsed;
++    struct timeval t1, t2, all_start, all_end;
+     periscope_cp_desc* cp_to_purge = NULL;
+     periscope_cp_policy *cp_policy = cp_policy_chain[i];
+ 
++    gettimeofday(&all_start, NULL);
+     while (candidates.num_cps > 0) {
+         assert(cp_policy->find_replacement_candidates);
+-
++        gettimeofday(&t1, NULL);
+         if (cp_policy->find_replacement_candidates(&candidates) == 1) {
+             // we found a single candidate
+-            printf("periscope: # of candidates = %d\n", candidates.num_cps);
+             cp_to_purge = candidates.cps[0];
+             num_evicted[i]++;
++            gettimeofday(&t2, NULL);
++            elapsed = get_elapsed_ms(t1, t2);
++            sprintf(log_buf, "Elapsed time for eviction policy %d: %fms", i, elapsed);
++            write_log(log_buf);
+             break;
+         }
+ 
+-        printf("periscope: # of candidates = %d\n", candidates.num_cps);
+ 
+         if (cp_policy_chain[i+1] == NULL) {
+             // no more policy exists.
++            gettimeofday(&t2, NULL);
++            elapsed = get_elapsed_ms(t1, t2);
++            sprintf(log_buf, "Elapsed time for eviction policy %d: %fms", i, elapsed);
++            write_log(log_buf);
+             break;
+         }
+ 
++        gettimeofday(&t2, NULL);
++        elapsed = get_elapsed_ms(t1, t2);
++        sprintf(log_buf, "Elapsed time for eviction policy %d: %fms", i, elapsed);
++        write_log(log_buf);
+         i++;
+         cp_policy = cp_policy_chain[i];
++
+     }
+ 
+     if (cp_to_purge == NULL) {
+@@ -1219,17 +1327,21 @@ static int periscope_maybe_purge_checkpoints(periscope_cp_desc *cp_to_store,
+     }
+ 
+     assert(cp_policy != NULL);
+-    printf("periscope: policy-%s decides to replace checkpoint %d\n",
+-           cp_policy->name, cp_to_purge->snapshot.id);
++    sprintf(log_buf, "checkpoint %d will be replaced", cp_to_purge->snapshot.id);
++    write_log(log_buf);
+ 
+     if (&cp_root == cp_to_purge) {
+         printf("periscope: root checkpoint cannot be replaced.\n");
+         return -2;
+     }
++    sprintf(log_buf, "# of children of root checkpoint: %d", cp_root.n_children);
++    write_log(log_buf);
+ 
+     // TODO: probably lift this constraint later
+     if (cp_to_purge->n_children > 0) {
+-        printf("periscope: checkpoint having any child cannot be replaced.\n");
++        // printf("periscope: checkpoint having any child cannot be replaced.\n");
++        sprintf(log_buf, "Error: trying to purge a non-leaf checkpoint");
++        write_log(log_buf);
+         return -3;
+     }
+ 
+@@ -1260,12 +1372,23 @@ static int periscope_maybe_purge_checkpoints(periscope_cp_desc *cp_to_store,
+     qemu_timeval time_since_last_restore;
+     qemu_gettimeofday(&now);
+     qemu_timersub(&now, &cp_to_purge->last_restored, &time_since_last_restore);
+-    printf("periscope: purging checkpoint periscope-%u (%lu ms saved for %d "
++    sprintf(
++        log_buf, "Purging checkpoint %u: restored %d times(total execution: %" PRIu64
++        "), saving %lums, last restore %lds ago",
++        cp_to_purge->snapshot.id, cp_to_purge->num_restored, execution_num,
++        calc_total_time_saved(cp_to_purge), time_since_last_restore.tv_sec
++    );
++    /* printf("periscope: purging checkpoint periscope-%u (%lu ms saved for %d "
+            "restores, last restore %ld s ago)\n",
+            cp_to_purge->snapshot.id, calc_total_time_saved(cp_to_purge),
+            cp_to_purge->num_restored, time_since_last_restore.tv_sec);
++    */
++    write_log(log_buf);
++    char path_buf[4096] = "";
++    get_path_to_root(cp_to_purge, path_buf);
+ 
+     // Detach from the parent with lots of checks
++    gettimeofday(&t1, NULL);
+     periscope_cp_desc *parent = cp_to_purge->parent;
+     assert(parent != NULL);
+     assert(parent->n_children > 0);
+@@ -1282,13 +1405,18 @@ static int periscope_maybe_purge_checkpoints(periscope_cp_desc *cp_to_store,
+     cp_to_purge->parent = NULL;
+ 
+     chkpt_memory_used -= compute_memory_cost(cp_to_purge);
++    gettimeofday(&t2, NULL);
++    elapsed = get_elapsed_ms(t1, t2);
++    sprintf(log_buf, "Elapsed time for detaching node: %fms, path to root: %s", elapsed, path_buf);
++    write_log(log_buf);
+ 
+     // Close all the associated file
++/*
+ #ifndef ENABLE_LW_CHKPT
+     assert(cp_to_purge->snapshot.memfd > -1);
+     close(cp_to_purge->snapshot.memfd);
+     cp_to_purge->snapshot.memfd = -1;
+-#else /* ENABLE_LW_CHKPT */
++#else
+ #ifndef PERI_DEDUP
+     if (cp_to_purge->snapshot.memfd_quick > -1) {
+         close(cp_to_purge->snapshot.memfd_quick);
+@@ -1321,28 +1449,44 @@ static int periscope_maybe_purge_checkpoints(periscope_cp_desc *cp_to_store,
+     }
+     cp_to_purge->snapshot.rambkp_size = 0;
+ #endif
+-#else /*PERI_DEDUP */
++#else
++*/
+     if(cp_to_purge->snapshot.peri_rb) {
+-       delete_peri_rbs(
+-             cp_to_purge->snapshot.peri_rb,
+-             cp_to_purge->snapshot.n_peri_rb,
+-             parent->snapshot.peri_rb);
+-       g_free(cp_to_purge->snapshot.peri_rb);
+-       cp_to_purge->snapshot.peri_rb = NULL;
+-       cp_to_purge->snapshot.n_peri_rb = 0;
++        int n_peri_rb = cp_to_purge->snapshot.n_peri_rb;
++        gettimeofday(&t1, NULL);
++        delete_peri_rbs(
++                cp_to_purge->snapshot.peri_rb,
++                cp_to_purge->snapshot.n_peri_rb,
++                parent->snapshot.peri_rb);
++        g_free(cp_to_purge->snapshot.peri_rb);
++        cp_to_purge->snapshot.peri_rb = NULL;
++        cp_to_purge->snapshot.n_peri_rb = 0;
++        gettimeofday(&t2, NULL);
++        elapsed = get_elapsed_ms(t1, t2);
++        sprintf(log_buf, "Elapsed time for cleaning %d peri_rbs: %fms", n_peri_rb, elapsed);
++        write_log(log_buf);
+     }
+     if (cp_to_purge->snapshot.buf_dev != NULL) {
++        gettimeofday(&t1, NULL);
+         g_free(cp_to_purge->snapshot.buf_dev);
+         cp_to_purge->snapshot.buf_dev = NULL;
+         cp_to_purge->snapshot.dev_sz = 0;
++        gettimeofday(&t2, NULL);
++        elapsed = get_elapsed_ms(t1, t2);
++        sprintf(log_buf, "Elapsed time for freeing buf_dev: %fms", elapsed);
++        write_log(log_buf);
+     }
+-#endif /*PERI_DEDUP */
+-#endif /*ENABLE_LW_CHKPT*/
++// #endif /*PERI_DEDUP */
++// #endif /*ENABLE_LW_CHKPT*/
+     cp_to_purge->snapshot.id = SNAPSHOT_INVALID;
+ 
+     // Delete the descriptor itself
+     free(cp_to_purge);
+     cp_to_purge = NULL;
++    gettimeofday(&all_end, NULL);
++    elapsed = get_elapsed_ms(all_start, all_end);
++    sprintf(log_buf, "Total elapsed time of a single eviction: %fms", elapsed);
++    write_log(log_buf);
+ 
+     return 0;
+ }
+@@ -1850,7 +1994,12 @@ int periscope_restore(void) {
+     periscope_cp_desc *cp_base = NULL; // base snapshot
+     periscope_cp_desc *cp_next = NULL; // to be restored
+     periscope_snapshot_desc *snap = NULL;
++    struct timeval t1, t2;
++    struct timeval all_start, all_end;
++    double elapsed;
++    char log_buf[1024] = "";
+ 
++    gettimeofday(&all_start, NULL);
+     FuzzerState *fs = fuzzer_get_current();
+     assert(fs);
+     assert(fs->cur_input);
+@@ -2078,6 +2227,7 @@ int periscope_restore(void) {
+     periscope_cp_desc *cp_dest = cp_next;
+     periscope_cp_desc *cp_lca = find_lowest_common_ancestor(cp_base, cp_next);
+     assert(cp_lca);
++
+ #ifdef TRACE_DELTA_RESTORE
+     printf("last snap %d, lca snap %d\n", cp_base->snapshot.id, cp_lca->snapshot.id);
+ #endif
+@@ -2091,6 +2241,7 @@ int periscope_restore(void) {
+     RAMBlock *rb;
+     qemu_mutex_lock_ramlist();
+     rcu_read_lock(); // see comment on INTERNAL_RAMBLOCK_FOREACH
++    gettimeofday(&t1, NULL);
+     RAMBLOCK_FOREACH_MIGRATABLE(rb) {
+        struct DirtyBitmapSnapshot *db_snap = memory_region_snapshot_and_clear_dirty(
+              rb->mr,
+@@ -2134,6 +2285,10 @@ int periscope_restore(void) {
+ #endif
+     }
+     fs->cur_input->num_pages_restored = total_dirty_cnt; //current_dirty_cnt + src_dirty_cnt + dst_dirty_cnt;
++    gettimeofday(&t2, NULL);
++    elapsed = get_elapsed_ms(t1, t2);
++    sprintf(log_buf, "Elapsed time of restoring ramblocks: %fms, dirty pages: %ld", elapsed, total_dirty_cnt);
++    write_log(log_buf);
+     rcu_read_unlock();
+     qemu_mutex_unlock_ramlist();
+ 
+@@ -2141,7 +2296,7 @@ int periscope_restore(void) {
+     QEMUFile *file;
+     MigrationIncomingState* mis;
+ 
+-
++    gettimeofday(&t1, NULL);
+     periscope_no_loadvm_state_cleanup = true;
+     periscope_no_loadvm_state_setup = true;
+     snap = &cp_dest->snapshot;
+@@ -2157,6 +2312,10 @@ int periscope_restore(void) {
+     object_unref(OBJECT(iochannel));
+     qemu_fclose(file);
+     file = NULL;
++    gettimeofday(&t2, NULL);
++    elapsed = get_elapsed_ms(t1, t2);
++    sprintf(log_buf, "Elapsed time of loading VM state(device?): %fms", elapsed);
++    write_log(log_buf);
+ 
+ //    //quick_reset_devs = true;
+ //    qemu_timeval tt0, tt1, tte, ttx0, ttx1, ttxe;
+@@ -2262,7 +2421,10 @@ int periscope_restore(void) {
+     assert(compare_ram_pages(cp_dest->snapshot.rambkp, NULL,
+           cp_dest->snapshot.rambkp_size, NULL, false));
+ #endif
+-
++    gettimeofday(&all_end, NULL);
++    elapsed = get_elapsed_ms(all_start, all_end);
++    sprintf(log_buf, "Elapsed time of single restoration: %fms, dirty pages: %ld", elapsed, total_dirty_cnt);
++    write_log(log_buf);
+     vm_start();
+ 
+     return 0;
+diff --git a/migration/periscope.h b/migration/periscope.h
+index 9f98e745ab..20be206602 100644
+--- a/migration/periscope.h
++++ b/migration/periscope.h
+@@ -2,6 +2,8 @@
+ #define PERISCOPE_H
+ 
+ #include <stdint.h>
++#include <sys/time.h>
++#include <time.h>
+ #include "qemu/thread.h"
+ #include "qom/object.h"
+ #include "sysemu/sysemu.h"
+@@ -29,6 +31,8 @@ struct syzkaller_execute_req {
+ 
+ #define MAX_INPUT_BYTES (kMaxInput + sizeof(struct syzkaller_execute_req))
+ 
++void write_log(const char *string);
++double get_elapsed_ms(struct timeval before, struct timeval after);
+ uint32_t periscope_get_agent_id(void);
+ void periscope_configure_dev(const char *optarg);
+ 
+@@ -55,7 +59,6 @@ enum PERISCOPE_RESTORE_POLICY {
+ };
+ 
+ int periscope_change_chkpt_policy(int, int);
+-
+ int periscope_purge_and_checkpoint_request(void);
+ int periscope_maybe_checkpoint_request(void);
+ void periscope_checkpoint_request(void);
+@@ -169,7 +172,7 @@ typedef struct periscope_snapshot_desc {
+ #endif /* PERI_DEDUP */
+ #else
+     unsigned long dirty[]; // TODO: delta?
+-#endif
++#endif /* ENABLE_LW_CHKPT */
+ 
+ } periscope_snapshot_desc;
+ 
+-- 
+2.17.1
+
